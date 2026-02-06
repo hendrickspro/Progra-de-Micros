@@ -1,0 +1,25 @@
+Variables:
+;Declaramos nuestra salida de la LED PB1 que es D9 en el arduino
+	LDI r16,  0b00000001
+	OUT DDRB, r16
+	LDI r18, 0x00
+	OUT PORTB, r18
+	LDI r19, 0x00
+	RJMP Encendido
+
+Delay:
+;Hacemos que gaste tiempo
+	INC r19
+	BRNE Delay
+	RET
+
+Encendido:
+;Encendemos la Led
+	LDI r17, 0b00000001
+	OUT PORTB, r17
+	CALL Delay
+;Apagamos la Led
+	LDI r20, 0x00
+	OUT PORTB, r20
+	CALL Delay
+	RJMP Encendido

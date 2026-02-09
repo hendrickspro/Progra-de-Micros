@@ -1,1 +1,54 @@
+;Lab 1 - Angel Ortiz 24377
+;Contador de 4 bits
+
+Variables:
+	;Contador 1
+		ldi r16, 0b01111000 //Puertos PD4, 5, 6, 7 como salidas de led  ;   Puertos PD2, 3 como entradas de boton
+		.def ValorCount1 = r16
+		out DDRD, ValorCount1 
+		.def Count1 = r17 //Variable temporal para sumar
+		.def Prev1 = r18 //Valor anterior para comparar
+		.def Resul1 = r19
+
+	clr Prev1 //Limpiamos el registro para no tener problemas
+
+Loop_Verificador:
+	;Contador 1
+		in Count1, PIND
+		lsr Count1
+		lsr Count1
+		lsr Count1
+		lsr Count1
+
+		//Incrementar
+		sbic PIND, 0b00000010
+		rjmp ContadorCre1
+
+		//Decrecer
+		sbic PIND, 0b00000100
+		rjmp ContadorDec1
+
+		//Si no pasa nada
+		cp Count1, Prev1
+		breq Print1
+		mov Prev1, Count1
+		
+	rjmp Loop_Verificador
+
+ContadorCre1:
+	andi Count1, 1
+	mov Resul1, Count1
+	rjmp Print1
+
+ContadorDec1:
+
+Print1:
+	lsl Resul1
+	lsl Resul1
+	lsl Resul1
+	lsl Resul1
+	out PORTD, Resul1
+
+	rjmp Loop_Verificador
+
 

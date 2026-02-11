@@ -1,53 +1,188 @@
 ;Lab 1 - Angel Ortiz 24377
-;Contador de 4 bits
+;Dos contadores 4 bits + Suma
+
+
 
 Variables:
-	;Contador 1
-		ldi r16, 0b01111000 //Puertos PD4, 5, 6, 7 como salidas de led  ;   Puertos PD2, 3 como entradas de boton
-		.def ValorCount1 = r16
-		out DDRD, ValorCount1 
-		.def Count1 = r17 //Variable temporal para sumar
-		.def Prev1 = r18 //Valor anterior para comparar
-		.def Resul1 = r19
 
-	clr Prev1 //Limpiamos el registro para no tener problemas
+	; ---- CONFIGURACION SALIDAS ----
+
+	; Counter1 PD4–PD7
+	ldi r16, 0b11110000
+	out DDRD, r16
+
+	; Counter2 + Resultado PC0–PC5
+	ldi r16, 0b00111111
+	out DDRC, r16
+
+	; PB0 salida (Carry), PB1–PB5 entradas
+	ldi r16, 0b00000001
+	out DDRB, r16
+
+	; Pull-up PB1–PB5
+	ldi r16, 0b00111110
+	out PORTB, r16
+
+
+	; ---- VARIABLES ----
+	.def Count1  = r17
+	.def Prev1   = r18
+	.def Resul1  = r19
+
+	.def Count2  = r20
+	.def Prev2   = r21
+	.def Resul2  = r22
+
+	.def Sumtemp = r23
+	.def Temp    = r24
+	.def Temp2   = r25
+
+	clr Prev1
+	clr Resul1
+	clr Prev2
+	clr Resul2
+	clr Count1
+	clr Count2
 
 Loop_Verificador:
-	;Contador 1
-		in Count1, PIND
-		lsr Count1
-		lsr Count1
-		lsr Count1
-		lsr Count1
+	Check_Inc1:
+	; INC CONT1 (PB1)
+	sbic PINB, 0b00000001
+	rjmp Check_Dec1
+	rjmp ContadorCre1
 
-		//Incrementar
-		sbic PIND, 0b00000010
-		rjmp ContadorCre1
+	Check_Dec1:
+	; DEC CONT1 (PB2)
+	sbic PINB, 0b00000010
+	rjmp Check_Inc2
+	rjmp ContadorDec1
 
-		//Decrecer
-		sbic PIND, 0b00000100
-		rjmp ContadorDec1
+	Check_Inc2:
+	; INC CONT2 (PB3)
+	sbic PINB, 0b00000100
+	rjmp Check_Dec2
+	rjmp ContadorCre2
 
-		//Si no pasa nada
-		cp Count1, Prev1
-		breq Print1
-		mov Prev1, Count1
-		
-	rjmp Loop_Verificador
+	Check_Dec2:
+	; DEC CONT2 (PB4)
+	sbic PINB, 0b00001000
+	rjmp Check_Suma
+	rjmp ContadorDec2
 
+	Check_Suma:
+	; SUMA (PB5)
+	sbic PINB, 0b00010000
+	rjmp clean
+	rjmp Suma
+
+	//Contador 1
 ContadorCre1:
-	andi Count1, 1
+	inc Count1
+	andi Count1, 0b00001111
 	mov Resul1, Count1
+
+Wait1:
+	sbis PINB, 0b00000001
+	rjmp Wait1
+
 	rjmp Print1
 
 ContadorDec1:
+	dec Count1
+	andi Count1, 0b00001111
+	mov Resul1, Count1
+
+Wait2:
+	sbis PINB, 0b00000010
+	rjmp Wait2
+
+	rjmp Print1
 
 Print1:
-	lsl Resul1
-	lsl Resul1
-	lsl Resul1
-	lsl Resul1
-	out PORTD, Resul1
+	mov Temp, Resul1
+	lsl Temp
+	lsl Temp
+	lsl Temp
+	lsl Temp
+	out PORTD, Temp
+	rjmp Loop_Verificador
+
+	//Contador 2
+ContadorCre2:
+	inc Count2
+	andi Count2, 0b00001111
+	mov Resul2, Count2
+
+Wait3:
+	sbis PINB, 0b00000100
+	rjmp Wait3
+
+	rjmp Print2
+
+ContadorDec2:
+	dec Count2
+	andi Count2, 0b00001111
+	mov Resul2, Count2
+
+Wait4:
+	sbis PINB, 0b00001000
+	rjmp Wait4
+
+	rjmp Print2
+
+Print2:
+
+	; PD2–PD3
+	in Temp, PORTD
+	andi Temp, 0b11110011
+	mov Temp2, Resul2
+	andi Temp2, 0b00000011
+	lsl Temp2
+	lsl Temp2
+	or Temp, Temp2
+	out PORTD, Temp
+
+	; PC4–PC5
+	in Temp, PORTC
+	andi Temp, 0b11001111
+	mov Temp2, Resul2
+	andi Temp2, 0b00001100
+	lsl Temp2
+	lsl Temp2
+	or Temp, Temp2
+	out PORTC, Temp
+
+	rjmp Loop_Verificador
+
+	//Suma
+Suma:
+	mov Sumtemp, Count1
+	add Sumtemp, Count2
+
+	brcc NoCarry
+	sbi PORTB, 0b00000000
+	rjmp Mostrar
+
+NoCarry:
+	cbi PORTB, 0b00000000
+
+Mostrar:
+	andi Sumtemp, 0b00001111
+	out PORTC, Sumtemp
+
+Wait5:
+	sbis PINB, 0b00010000
+	rjmp Wait5
+
+	rjmp Loop_Verificador
+	
+	//Reset (Clean)
+Clean:
+	in Temp, PORTC
+	andi Temp, 0b11110000
+	out PORTC, Temp
+	cbi PORTB, 0b00000000
+	rjmp Loop_Verificador
 
 	rjmp Loop_Verificador
 

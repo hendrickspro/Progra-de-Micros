@@ -1,0 +1,68 @@
+; Angel Ortiz - 24377
+; F-cpu = 1 MHz
+; Timer0 - 100ms
+
+.include "m328pdef.inc"
+
+.def contador = r16
+.def temp     = r17
+
+.org 0x0000
+rjmp Reset
+
+Reset:
+	
+; Inicializar Pila
+    ldi temp, HIGH(RAMEND)
+    out SPH, temp
+    ldi temp, LOW(RAMEND)
+    out SPL, temp
+
+	ldi r16, 0x00
+	sts UCSR0B, r16
+
+;Setting prescaler
+	ldi r16, ( 1 << CLKPCE)
+	sts CLKPR, r16
+	ldi r16, 0b00000100
+	sts CLKPR, r16
+
+; Configurar PD2–PD5 como salidas del contador
+    ldi temp, 0x0F
+    out DDRC, temp
+
+; Configurar Puerto D como salidas del Display
+	ldi temp, 0x00
+	out DDRD, temp
+
+; Inicializar contador
+    clr contador
+
+; Configurar Timer0 - Modo Normal - Prescaler 1024
+    ldi temp, 0x00
+    out TCCR0A, temp
+
+    ldi temp, (1 << CS02) | (1 << CS00)
+    out TCCR0B, temp
+
+loop:
+    rcall Delay_100ms
+
+    inc contador
+    andi contador, 0x0F   ; limitar a 4 bits
+    out PORTC, contador
+
+    rjmp loop
+
+Delay_100ms:
+    ldi temp, 158
+    out TCNT0, temp
+
+Overflow:
+    sbis TIFR0, TOV0
+    rjmp Overflow
+
+    ldi temp, (1<<TOV0)
+    out TIFR0, temp
+
+ret

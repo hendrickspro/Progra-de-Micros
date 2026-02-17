@@ -1,3 +1,5 @@
+//Prelab 2
+
 ; Angel Ortiz - 24377
 ; F-cpu = 1 MHz
 ; Timer0 - 100ms
@@ -66,3 +68,183 @@ Overflow:
     out TIFR0, temp
 
 ret
+
+// lab 2
+;Angel Ortiz -24377
+;Lab2 - Contador con display de 7 segmentos
+
+.include "M328PDEF.inc"
+
+.dseg
+.org    SRAM_START
+counter:        .byte   1
+   
+.cseg
+.org 0x0000
+    rjmp    Reset
+
+// Tabla para display de 7 segmentos CÁTODO COMÚN (0-F hexadecimal)
+// Conexión: A=PD0, B=PD1, C=PD2, D=PD3, E=PD4, F=PD5, G=PD6
+// Formato binario: GFEDCBA (bit 6 a bit 0)
+.org 0x0040
+table7seg:  .DB 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71
+//              0     1     2     3     4     5     6     7     8     9     A     b     C     d     E     F
+
+.org 0x0050
+Reset:
+    // Configuración de la pila
+    ldi     R16, LOW(RAMEND)
+    out     SPL, R16
+    ldi     R16, HIGH(RAMEND)
+    out     SPH, R16
+
+    // Setting Prescaler del CPU
+    ldi     R16, (1 << CLKPCE)
+    sts     CLKPR, R16
+    ldi     R16, 0b00000100
+    sts     CLKPR, R16
+    
+    // Configurar PORTD como salidas (Display de 7 segmentos)
+    ldi     R16, 0b01111111
+    out     DDRD, R16
+
+    // Disable UART (so PD0 and PD1 can be used)
+    ldi     R16, 0x00
+    sts     UCSR0B, R16
+
+    // Configurar PB0 y PB1 como entradas con pull-up
+    cbi     DDRB, DDB0
+    cbi     DDRB, DDB1
+    sbi     PORTB, PORTB0
+    sbi     PORTB, PORTB1
+
+    // Inicializar contador en 0
+    ldi     R16, 0
+    sts     counter, R16
+
+    // Mostrar valor inicial (0)
+    call    Update_display
+
+Main_loop:
+    // Verificar botón B1 (PB0) - Incremento
+    sbis    PINB, PINB0
+    call    Button_increment
+
+    // Verificar botón B2 (PB1) - Decremento
+    sbis    PINB, PINB1
+    call    Button_decrement
+
+    rjmp    Main_loop
+
+Button_increment:
+    push    R16
+    push    R17
+
+    // Anti-rebote: esperar a que se suelte el botón
+Wait_release_inc:
+    sbis    PINB, PINB0
+    rjmp    Wait_release_inc
+
+    // Delay adicional para anti-rebote
+    call    Delay_50ms
+
+    // Incrementar contador
+    lds     R17, counter
+    inc     R17
+    
+    // Verificar si pasó de 15
+    cpi     R17, 16
+    brlo    Save_inc
+    ldi     R17, 0
+
+Save_inc:
+    sts     counter, R17
+    call    Update_display
+
+    pop     R17
+    pop     R16
+    ret
+
+Button_decrement:
+    push    R16
+    push    R17
+
+    // Anti-rebote: esperar a que se suelte el botón
+Wait_release_dec:
+    sbis    PINB, PINB1
+    rjmp    Wait_release_dec
+
+    // Delay adicional para anti-rebote
+    call    Delay_50ms
+
+    // Decrementar contador
+    lds     R17, counter
+    dec     R17
+    
+    // Verificar si pasó de 0 (underflow)
+    cpi     R17, 0xFF
+    brne    Save_dec
+    ldi     R17, 15
+
+Save_dec:
+    sts     counter, R17
+    call    Update_display
+
+    pop     R17
+    pop     R16
+    ret
+
+Update_display:
+    push    R16
+    push    R17
+    push    R30
+    push    R31
+
+    // Cargar valor del contador
+    lds     R17, counter
+    
+    // Apuntar Z a la tabla
+    ldi     ZH, HIGH(table7seg<<1)
+    ldi     ZL, LOW(table7seg<<1)
+    
+    // Agregar offset del contador a Z
+    add     ZL, R17
+    ldi     R16, 0
+    adc     ZH, R16
+    
+    // Leer valor de la tabla
+    lpm     R16, Z
+    
+    // Mostrar en PORTD (solo bits 0-6)
+    andi    R16, 0b01111111
+    out     PORTD, R16
+
+    pop     R31
+    pop     R30
+    pop     R17
+    pop     R16
+    ret
+
+Delay_50ms:
+    push    R16
+    push    R17
+    push    R18
+
+    // F_cpu = 1MHz
+    // Necesitamos ~50,000 ciclos para 50ms
+    ldi     R18, 200
+
+Delay_outer:
+    ldi     R17, 250
+
+Delay_inner:
+    dec     R17
+    brne    Delay_inner
+    
+    dec     R18
+    brne    Delay_outer
+
+    pop     R18
+    pop     R17
+    pop     R16
+    ret

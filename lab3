@@ -1,1 +1,124 @@
+; Angel Ortiz - 24377
+; F-cpu = 1 MHz
+; Contador manual: PB0 = Incrementar | PB1 = Decrementar
 
+.include "m328pdef.inc"
+
+.def contador = r16
+.def temp     = r17
+.def dly1     = r18         ; Registros para el delay de antirebote
+.def dly2     = r19
+
+.org 0x0000
+    rjmp Reset
+
+.org 0x0006                         ; Vector PCINT0 (Puerto B)
+    rjmp ISR_PinChange
+.org 0x0034
+
+Reset:
+
+    ; Inicializar Pila
+    ldi temp, HIGH(RAMEND)
+    out SPH, temp
+    ldi temp, LOW(RAMEND)
+    out SPL, temp
+
+    ; Deshabilitar USART (libera PB0/PB1)
+    ldi temp, 0x00
+    sts UCSR0B, temp
+
+    ; Setting prescaler (F_cpu = 1 MHz)
+    ldi temp, (1 << CLKPCE)
+    sts CLKPR, temp
+    ldi temp, 0b00000100
+    sts CLKPR, temp
+
+    ; Configurar PC0–PC3 como salidas del contador
+    ldi temp, 0x0F
+    out DDRC, temp
+
+    ; Configurar PB0 y PB1 como entradas con Pull-up interno
+    cbi DDRB,  DDB0
+    cbi DDRB,  DDB1
+    sbi PORTB, PORTB0
+    sbi PORTB, PORTB1
+
+    ; Habilitar interrupción por cambio de pin grupo B
+    ldi temp, (1 << PCIE0)
+    sts PCICR, temp
+
+    ; Habilitar solo PCINT0 (PB0) y PCINT1 (PB1)
+    ldi temp, (1 << PCINT0) | (1 << PCINT1)
+    sts PCMSK0, temp
+
+    ; Inicializar contador y mostrar en PORTC
+    clr contador
+    out PORTC, contador
+
+    ; Habilitar interrupciones globales
+    sei
+
+loop:
+    rjmp loop
+
+;       DELAY ~20ms (antirebote)
+;       F_cpu = 1MHz → 1 ciclo = 1µs
+;       Loop interno: 4 ciclos → 4µs
+;       78 * 64 * 4µs ≈ 19.968ms ≈ 20ms
+Delay_20ms:
+    push dly1
+    push dly2
+
+    ldi  dly2, 78               ; Contador externo
+Outer:
+    ldi  dly1, 64               ; Contador interno
+Inner:
+    dec  dly1                   ; 1 ciclo
+    nop                         ; 1 ciclo
+    brne Inner                  ; 2 ciclos si salta, 1 si no → ~4 ciclos por iteración
+    dec  dly2
+    brne Outer
+
+    pop dly2
+    pop dly1
+    ret
+
+ISR_PinChange:
+    push temp
+    in   temp, SREG
+    push temp                   ; Guardar SREG
+    push dly1                   ; Guardar registros del delay
+    push dly2
+
+    ; ── Antirebote: esperar 20ms y verificar que el pin siga en LOW ──
+    rcall Delay_20ms
+
+    ; Verificar PB0 (sigue en LOW tras el delay = pulsación válida)
+    sbis PINB, PINB0
+    rjmp Incrementar
+
+    ; Verificar PB1 (sigue en LOW tras el delay = pulsación válida)
+    sbis PINB, PINB1
+    rjmp Decrementar
+
+    rjmp Fin_ISR                ; Pin ya subió → era rebote, ignorar
+
+Incrementar:
+    inc  contador
+    andi contador, 0x0F
+    out  PORTC, contador
+    rjmp Fin_ISR
+
+Decrementar:
+    dec  contador
+    andi contador, 0x0F
+    out  PORTC, contador
+
+Fin_ISR:
+    pop  dly2
+    pop  dly1
+    pop  temp
+    out  SREG, temp
+    pop  temp
+    reti

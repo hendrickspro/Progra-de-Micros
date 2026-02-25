@@ -1,124 +1,140 @@
-; Angel Ortiz - 24377
-; F-cpu = 1 MHz
-; Contador manual: PB0 = Incrementar | PB1 = Decrementar
+; Registros
+.def temp      = r16
+.def unidades  = r17
+.def decenas   = r18
+.def ms_low    = r19
+.def ms_high   = r20
+.def mux       = r21
 
-.include "m328pdef.inc"
-
-.def contador = r16
-.def temp     = r17
-.def dly1     = r18         ; Registros para el delay de antirebote
-.def dly2     = r19
-
+; Vectores
+.cseg
 .org 0x0000
-    rjmp Reset
+rjmp start
 
-.org 0x0006                         ; Vector PCINT0 (Puerto B)
-    rjmp ISR_PinChange
-.org 0x0034
+.org 0x001C
+rjmp TIMER0_COMPA_ISR
 
-Reset:
+;====================================================
+; TABLA 7 SEGMENTOS (CÁTODO COMÚN)
+; A=PD0, B=PD1, C=PD2, D=PD3, E=PD4, F=PD5, G=PD6
+;====================================================
+.org 0x0040
+table7seg:
+.DB 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F, 0x77
+;     0     1     2     3     4     5     6     7     8     9     10
 
-    ; Inicializar Pila
-    ldi temp, HIGH(RAMEND)
-    out SPH, temp
-    ldi temp, LOW(RAMEND)
-    out SPL, temp
+; START
+start:
+    clr r1
 
-    ; Deshabilitar USART (libera PB0/PB1)
-    ldi temp, 0x00
-    sts UCSR0B, temp
+; Desactivar USART (Uso de PD0 y PD1)
+    ldi temp, 0x00
+    sts UCSR0B, temp
 
-    ; Setting prescaler (F_cpu = 1 MHz)
-    ldi temp, (1 << CLKPCE)
-    sts CLKPR, temp
-    ldi temp, 0b00000100
-    sts CLKPR, temp
+; Configurar PD0–PD6 como salida
+    ldi temp, 0x7F
+    out DDRD, temp
 
-    ; Configurar PC0–PC3 como salidas del contador
-    ldi temp, 0x0F
-    out DDRC, temp
+; Limpiar PORTD
+    clr temp
+    out PORTD, temp
 
-    ; Configurar PB0 y PB1 como entradas con Pull-up interno
-    cbi DDRB,  DDB0
-    cbi DDRB,  DDB1
-    sbi PORTB, PORTB0
-    sbi PORTB, PORTB1
+; PB2 y PB3 como salida (multiplexado)
+    ldi temp, (1<<PB2)|(1<<PB3)
+    out DDRB, temp
 
-    ; Habilitar interrupción por cambio de pin grupo B
-    ldi temp, (1 << PCIE0)
-    sts PCICR, temp
+; Inicializar variables
+    clr unidades
+    clr decenas
+    clr ms_low
+    clr ms_high
+    clr mux
 
-    ; Habilitar solo PCINT0 (PB0) y PCINT1 (PB1)
-    ldi temp, (1 << PCINT0) | (1 << PCINT1)
-    sts PCMSK0, temp
+; TIMER0 CTC 1ms EXACTO
 
-    ; Inicializar contador y mostrar en PORTC
-    clr contador
-    out PORTC, contador
+; Modo CTC
+    ldi temp, (1<<WGM01)
+    out TCCR0A, temp
 
-    ; Habilitar interrupciones globales
-    sei
+; Prescaler 64
+    ldi temp, (1<<CS01)|(1<<CS00)
+    out TCCR0B, temp
 
-loop:
-    rjmp loop
+; 16MHz /64 = 250kHz
+; 250 cuentas = 1ms
+    ldi temp, 249
+    out OCR0A, temp
 
-;       DELAY ~20ms (antirebote)
-;       F_cpu = 1MHz → 1 ciclo = 1µs
-;       Loop interno: 4 ciclos → 4µs
-;       78 * 64 * 4µs ≈ 19.968ms ≈ 20ms
-Delay_20ms:
-    push dly1
-    push dly2
+; Habilitar interrupción
+    ldi temp, (1<<OCIE0A)
+    sts TIMSK0, temp
 
-    ldi  dly2, 78               ; Contador externo
-Outer:
-    ldi  dly1, 64               ; Contador interno
-Inner:
-    dec  dly1                   ; 1 ciclo
-    nop                         ; 1 ciclo
-    brne Inner                  ; 2 ciclos si salta, 1 si no → ~4 ciclos por iteración
-    dec  dly2
-    brne Outer
+    sei
 
-    pop dly2
-    pop dly1
-    ret
+main:
+    rjmp main
 
-ISR_PinChange:
-    push temp
-    in   temp, SREG
-    push temp                   ; Guardar SREG
-    push dly1                   ; Guardar registros del delay
-    push dly2
+; ISR TIMER0
+TIMER0_COMPA_ISR:
 
-    ; ── Antirebote: esperar 20ms y verificar que el pin siga en LOW ──
-    rcall Delay_20ms
+; Apagar displays
+    cbi PORTB, PB2
+    cbi PORTB, PB3
 
-    ; Verificar PB0 (sigue en LOW tras el delay = pulsación válida)
-    sbis PINB, PINB0
-    rjmp Incrementar
+; Multiplexado
+    tst mux
+    breq mostrar_unidades
 
-    ; Verificar PB1 (sigue en LOW tras el delay = pulsación válida)
-    sbis PINB, PINB1
-    rjmp Decrementar
+mostrar_decenas:
+    mov temp, decenas
+    rcall get_pattern
+    out PORTD, temp
+    sbi PORTB, PB2
+    clr mux
+    rjmp continuar
 
-    rjmp Fin_ISR                ; Pin ya subió → era rebote, ignorar
+mostrar_unidades:
+    mov temp, unidades
+    rcall get_pattern
+    out PORTD, temp
+    sbi PORTB, PB3
+    ldi mux,1
 
-Incrementar:
-    inc  contador
-    andi contador, 0x0F
-    out  PORTC, contador
-    rjmp Fin_ISR
+continuar:
 
-Decrementar:
-    dec  contador
-    andi contador, 0x0F
-    out  PORTC, contador
+; Contador exacto 1000 ms
+    inc ms_low
+    cpi ms_low, 250
+    brne fin_isr
 
-Fin_ISR:
-    pop  dly2
-    pop  dly1
-    pop  temp
-    out  SREG, temp
-    pop  temp
-    reti
+    clr ms_low
+    inc ms_high
+    cpi ms_high, 4
+    brne fin_isr
+
+;----- 1 SEGUNDO EXACTO -----
+    clr ms_high
+
+    inc unidades
+    cpi unidades,10
+    brlo fin_isr
+
+    clr unidades
+    inc decenas
+    cpi decenas,6
+    brlo fin_isr
+
+; Si llega a 60 → reset
+    clr decenas
+
+fin_isr:
+    reti
+
+; Funcion Tabla
+get_pattern:
+    ldi ZH, high(table7seg<<1)
+    ldi ZL, low(table7seg<<1)
+    add ZL, temp
+    adc ZH, r1
+    lpm temp, Z
+    ret

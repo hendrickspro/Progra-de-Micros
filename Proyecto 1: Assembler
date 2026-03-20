@@ -1,0 +1,1191 @@
+; ==============================================================================
+; Proyecto: Reloj Digital con Alarma y Fecha
+; MCU: ATmega328P @ 16MHz
+; ==============================================================================
+; PINOUT:
+;   PC0 = Decena Hora/Dia  | PC1 = Unidad Hora/Dia
+;   PC2 = Decena Min/Mes   | PC3 = Unidad Min/Mes
+;   PC4 = LED Edicion      | PC5 = LED Display (7seg enable)
+;   PD0-PD6 = Segmentos    | PD7 = Buzzer Alarma
+;   PB0 = Ciclo Modos      | PB1 = Apagar Alarma
+;   PB2 = Incrementar      | PB3 = Decrementar
+;   PB4 = Cambiar Grupo    | PB5 = LED Hora
+; ==============================================================================
+; MODOS:
+;   0 = MostrarHora
+;   1 = EdicionReloj
+;   2 = MostrarFecha
+;   3 = EdicionFecha
+;   4 = SetAlarm
+; ==============================================================================
+
+; ------------------------------------------------------------------------------
+; Definicion de registros
+; ------------------------------------------------------------------------------
+.def temp     = r16     ; Registro de uso general
+.def mux      = r17     ; Contador de multiplexado (0-3)
+.def modo     = r18     ; Modo actual del sistema
+.def blink    = r19     ; Estado del parpadeo (0=ON, 1=OFF)
+.def grupo    = r20     ; Grupo de edicion (0=Min/Dia, 1=Hora/Mes)
+.def HoraUniA = r21     ; Unidad hora alarma
+.def HoraDecA = r22     ; Decena hora alarma
+.def MinUniA  = r23     ; Unidad minuto alarma
+.def MinDecA  = r24     ; Decena minuto alarma
+
+; ------------------------------------------------------------------------------
+; Variables en SRAM
+; ------------------------------------------------------------------------------
+.dseg
+MinUni:         .byte 1     ; Unidad minutos reloj
+MinDec:         .byte 1     ; Decena minutos reloj
+HoraUni:        .byte 1     ; Unidad hora reloj
+HoraDec:        .byte 1     ; Decena hora reloj
+MsLow:          .byte 1     ; Contador ms bajo  (0-249)
+MsHigh:         .byte 1     ; Contador ms alto  (0-3) -> 250*4=1000 ticks=1seg
+Segundos:       .byte 1     ; Segundos (0-59)
+BlinkCnt:       .byte 1     ; Contador blink (0-249) -> toggle cada 250ms
+MesUni:         .byte 1     ; Unidad mes
+MesDec:         .byte 1     ; Decena mes
+AnnoUni:        .byte 1     ; Unidad anno
+AnnoDec:        .byte 1     ; Decena anno
+DiaUni:         .byte 1     ; Unidad dia
+DiaDec:         .byte 1     ; Decena dia
+AlarmOn:        .byte 1     ; 1 = alarma sonando
+MinutoCambio:   .byte 1     ; 1 = minuto recien incrementado
+
+; ------------------------------------------------------------------------------
+; Segmento de codigo
+; ------------------------------------------------------------------------------
+.cseg
+
+.org 0x0000
+    rjmp Start
+
+.org 0x0006
+    rjmp Pcint0Isr          ; Pin Change Interrupt PB0
+
+.org 0x001C
+    rjmp Timer0Isr          ; Timer0 Compare Match A (cada 1ms)
+
+; Tabla de patrones 7 segmentos (0-9)
+.org 0x0040
+Table7Seg:
+    .DB 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
+
+; ==============================================================================
+; INICIO - Configuracion de hardware
+; ==============================================================================
+Start:
+    clr r1
+
+    ldi  temp, 0x00
+    sts  UCSR0B, temp               ; Deshabilitar USART
+
+    ; Puerto D: todos salidas (segmentos + buzzer)
+    ldi  temp, 0xFF
+    out  DDRD, temp
+    clr  temp
+    out  PORTD, temp
+
+    ; Puerto B: PB3 y PB5 como salidas (LEDs), resto entradas con pull-up
+    ldi  temp, (1<<PB3)|(1<<PB5)
+    out  DDRB, temp
+    clr  temp
+    out  PORTB, temp
+    cbi  DDRB, PB0
+    cbi  DDRB, PB1
+    cbi  DDRB, PB2
+    cbi  DDRB, PB3
+    cbi  DDRB, PB4
+    sbi  PORTB, PB0
+    sbi  PORTB, PB1
+    sbi  PORTB, PB2
+    sbi  PORTB, PB3
+    sbi  PORTB, PB4
+
+    ; Puerto C: todos salidas (anodos displays + LEDs)
+    ldi  temp, (1<<PC0)|(1<<PC1)|(1<<PC2)|(1<<PC3)|(1<<PC4)|(1<<PC5)
+    out  DDRC, temp
+    clr  temp
+    out  PORTC, temp
+
+    ; Limpiar SRAM (16 bytes desde MinUni)
+    ldi  ZH, high(MinUni)
+    ldi  ZL, low(MinUni)
+    ldi  temp, 16
+InicioLoop:
+        st   Z+, r1
+        dec  temp
+        brne InicioLoop
+
+    ; Valores iniciales de fecha: 01/01
+    ldi  temp, 1
+    sts  MesUni, temp
+    ldi  temp, 1
+    sts  DiaUni, temp
+
+    ; Registros de alarma en cero
+    clr  HoraUniA
+    clr  HoraDecA
+    clr  MinUniA
+    clr  MinDecA
+    clr  mux
+    clr  modo
+    clr  blink
+    clr  grupo
+
+    ; Timer0 en modo CTC, prescaler 64
+    ; 16MHz / 64 / 250 = 1000Hz -> interrupcion cada 1ms
+    ldi  temp, (1<<WGM01)
+    out  TCCR0A, temp
+    ldi  temp, (1<<CS01)|(1<<CS00)
+    out  TCCR0B, temp
+    ldi  temp, 249
+    out  OCR0A, temp
+    ldi  temp, (1<<OCIE0A)
+    sts  TIMSK0, temp
+
+    ; PCINT0: habilitar interrupcion por cambio en PB0
+    ldi  temp, (1<<PCIE0)
+    sts  PCICR, temp
+    ldi  temp, (1<<PCINT0)
+    sts  PCMSK0, temp
+
+    sei
+
+; ==============================================================================
+; MAIN - Loop principal
+; Maneja LEDs de estado y despacha al modo activo
+; ==============================================================================
+Main:
+    ; --- Control de LEDs segun modo ---
+    ; PC4 fija ON  : modos edicion (1, 3)
+    ; PB5 fija ON  : modos hora    (0, 1)
+    ; Ambas blink  : modo alarma   (4)
+    ; Ambas OFF    : modo fecha    (2)
+    cpi  modo, 4
+    breq MainLedsBlink
+    cpi  modo, 1
+    breq MainPC4On
+    cpi  modo, 3
+    breq MainPC4On
+    cbi  PORTC, PC4
+    rjmp MainPB5
+    MainPC4On:
+        sbi  PORTC, PC4
+    MainPB5:
+        cpi  modo, 0
+        breq MainPB5On
+        cpi  modo, 1
+        breq MainPB5On
+        cbi  PORTB, PB5
+        rjmp MainBuzzer
+        MainPB5On:
+            sbi  PORTB, PB5
+            rjmp MainBuzzer
+
+    MainLedsBlink:
+        ; Modo 4: ambas LEDs siguen registro blink (toggle cada 250ms)
+        tst  blink
+        breq MainLedsOff
+        sbi  PORTC, PC4
+        sbi  PORTB, PB5
+        rjmp MainBuzzer
+        MainLedsOff:
+            cbi  PORTC, PC4
+            cbi  PORTB, PB5
+
+    ; --- Control buzzer ---
+    MainBuzzer:
+        lds  temp, AlarmOn
+        tst  temp
+        breq MainBuzzerOff
+        sbis PINB, PB1
+        rjmp MainApagarAlarma
+        rjmp MainCheckModo
+        MainApagarAlarma:
+            sts  AlarmOn, r1
+            cbi  PORTD, PD7
+            MainWaitPB1:
+                sbis PINB, PB1
+                rjmp MainWaitPB1
+            rjmp MainCheckModo
+        MainBuzzerOff:
+            cbi  PORTD, PD7
+
+    ; --- Despacho de modos ---
+    MainCheckModo:
+        tst  modo
+        breq Main
+        cpi  modo, 1
+        breq EdicionReloj
+        cpi  modo, 2
+        breq JmpMostrarFecha
+        cpi  modo, 3
+        breq JmpEdicionFecha
+        cpi  modo, 4
+        breq JmpSetAlarm
+        rjmp Main
+        JmpMostrarFecha:
+            rjmp MostrarFecha
+        JmpEdicionFecha:
+            rjmp EdicionFecha
+        JmpSetAlarm:
+            rjmp SetAlarm
+
+; ==============================================================================
+; MODO 1 - EdicionReloj
+; grupo=0: edita Minutos | grupo=1: edita Horas
+; PB2=Inc | PB3=Dec | PB4=CambiarGrupo
+; ==============================================================================
+EdicionReloj:
+    sbic PINB, PB2
+    rjmp RelojCheckPb3
+    tst  grupo
+    breq RelojIncMinutos
+    rjmp RelojIncHoras
+
+    RelojIncHoras:
+        lds  temp, HoraUni
+        inc  temp
+        sts  HoraUni, temp
+        cpi  temp, 10
+        brlo RelojCheckInc24
+        sts  HoraUni, r1
+        lds  temp, HoraDec
+        inc  temp
+        sts  HoraDec, temp
+        RelojCheckInc24:
+            lds  temp, HoraDec
+            cpi  temp, 2
+            brne RelojWaitPb2
+            lds  temp, HoraUni
+            cpi  temp, 4
+            brne RelojWaitPb2
+            sts  HoraUni, r1
+            sts  HoraDec, r1
+            rjmp RelojWaitPb2
+
+    RelojIncMinutos:
+        lds  temp, MinUni
+        inc  temp
+        sts  MinUni, temp
+        cpi  temp, 10
+        brlo RelojWaitPb2
+        sts  MinUni, r1
+        lds  temp, MinDec
+        inc  temp
+        sts  MinDec, temp
+        cpi  temp, 6
+        brlo RelojWaitPb2
+        sts  MinUni, r1
+        sts  MinDec, r1
+
+    RelojWaitPb2:
+        sbis PINB, PB2
+        rjmp RelojWaitPb2
+
+    RelojCheckPb3:
+        sbic PINB, PB3
+        rjmp RelojCheckPb4
+        tst  grupo
+        breq RelojDecMinutos
+
+        RelojDecHoras:
+            lds  temp, HoraUni
+            tst  temp
+            brne RelojDecHoraUni
+            lds  temp, HoraDec
+            tst  temp
+            brne RelojDecHoraBorrow
+            ldi  temp, 2
+            sts  HoraDec, temp
+            ldi  temp, 3
+            sts  HoraUni, temp
+            rjmp RelojWaitPb3
+            RelojDecHoraBorrow:
+                dec  temp
+                sts  HoraDec, temp
+                ldi  temp, 9
+                sts  HoraUni, temp
+                rjmp RelojWaitPb3
+            RelojDecHoraUni:
+                dec  temp
+                sts  HoraUni, temp
+                rjmp RelojWaitPb3
+
+        RelojDecMinutos:
+            lds  temp, MinUni
+            tst  temp
+            brne RelojDecMinUni
+            lds  temp, MinDec
+            tst  temp
+            brne RelojDecMinBorrow
+            ldi  temp, 5
+            sts  MinDec, temp
+            ldi  temp, 9
+            sts  MinUni, temp
+            rjmp RelojWaitPb3
+            RelojDecMinBorrow:
+                dec  temp
+                sts  MinDec, temp
+                ldi  temp, 9
+                sts  MinUni, temp
+                rjmp RelojWaitPb3
+            RelojDecMinUni:
+                dec  temp
+                sts  MinUni, temp
+
+    RelojWaitPb3:
+        sbis PINB, PB3
+        rjmp RelojWaitPb3
+
+    RelojCheckPb4:
+        sbic PINB, PB4
+        rjmp Main
+        tst  grupo
+        breq RelojIrAHoras
+        clr  grupo
+        clr  blink
+        sts  BlinkCnt, r1
+        rjmp RelojWaitPb4
+        RelojIrAHoras:
+            ldi  grupo, 1
+            clr  blink
+            sts  BlinkCnt, r1
+        RelojWaitPb4:
+            sbis PINB, PB4
+            rjmp RelojWaitPb4
+            rjmp Main
+
+; ==============================================================================
+; MODO 2 - MostrarFecha
+; Solo visualizacion, el ISR maneja el display
+; ==============================================================================
+MostrarFecha:
+    rjmp Main
+
+; ==============================================================================
+; MODO 3 - EdicionFecha
+; grupo=0: edita Dia | grupo=1: edita Mes
+; Valida dias por mes (28/29/30/31)
+; ==============================================================================
+EdicionFecha:
+    sbic PINB, PB2
+    rjmp FechaCheckPb3
+    tst  grupo
+    breq FechaIncDia
+    rjmp FechaIncMes
+
+    FechaIncDia:
+        lds  temp, DiaUni
+        inc  temp
+        sts  DiaUni, temp
+        cpi  temp, 10
+        brlo FechaCheckMaxDia
+        sts  DiaUni, r1
+        lds  temp, DiaDec
+        inc  temp
+        sts  DiaDec, temp
+        FechaCheckMaxDia:
+            rcall GetMaxDias
+            rcall GetDiaActual
+            cp   temp, r25
+            brlo FechaWaitPb2
+            ldi  temp, 1
+            sts  DiaUni, temp
+            sts  DiaDec, r1
+            rjmp FechaWaitPb2
+
+    FechaIncMes:
+        lds  temp, MesUni
+        inc  temp
+        sts  MesUni, temp
+        cpi  temp, 10
+        brlo FechaCheckInc13
+        sts  MesUni, r1
+        lds  temp, MesDec
+        inc  temp
+        sts  MesDec, temp
+        FechaCheckInc13:
+            lds  temp, MesDec
+            cpi  temp, 1
+            brne FechaWaitPb2
+            lds  temp, MesUni
+            cpi  temp, 3
+            brne FechaWaitPb2
+            ldi  temp, 1
+            sts  MesUni, temp
+            sts  MesDec, r1
+            rcall LimitarDia
+            rjmp FechaWaitPb2
+
+    FechaWaitPb2:
+        sbis PINB, PB2
+        rjmp FechaWaitPb2
+
+    FechaCheckPb3:
+        sbic PINB, PB3
+        rjmp FechaCheckPb4
+        tst  grupo
+        breq FechaDecDia
+        rjmp FechaDecMes
+
+        FechaDecDia:
+            lds  temp, DiaUni
+            tst  temp
+            brne FechaDecDiaUni
+            lds  temp, DiaDec
+            tst  temp
+            brne FechaDecDiaBorrow
+            rcall GetMaxDias
+            rcall SetDiaDesdeR25
+            rjmp FechaWaitPb3
+            FechaDecDiaBorrow:
+                dec  temp
+                sts  DiaDec, temp
+                ldi  temp, 9
+                sts  DiaUni, temp
+                rjmp FechaWaitPb3
+            FechaDecDiaUni:
+                dec  temp
+                sts  DiaUni, temp
+                rcall GetDiaActual
+                tst  temp
+                brne FechaWaitPb3
+                rcall GetMaxDias
+                rcall SetDiaDesdeR25
+                rjmp FechaWaitPb3
+
+        FechaDecMes:
+            lds  temp, MesUni
+            cpi  temp, 1
+            brne FechaDecMesUni
+            lds  temp, MesDec
+            tst  temp
+            breq FechaMesWrap
+            dec  temp
+            sts  MesDec, temp
+            ldi  temp, 9
+            sts  MesUni, temp
+            rjmp FechaDecMesAjusta
+            FechaMesWrap:
+                ldi  temp, 1
+                sts  MesDec, temp
+                ldi  temp, 2
+                sts  MesUni, temp
+                rjmp FechaDecMesAjusta
+            FechaDecMesUni:
+                dec  temp
+                sts  MesUni, temp
+            FechaDecMesAjusta:
+                rcall LimitarDia
+
+    FechaWaitPb3:
+        sbis PINB, PB3
+        rjmp FechaWaitPb3
+
+    FechaCheckPb4:
+        sbic PINB, PB4
+        rjmp Main
+        tst  grupo
+        breq FechaIrAMes
+        clr  grupo
+        clr  blink
+        sts  BlinkCnt, r1
+        rjmp FechaWaitPb4
+        FechaIrAMes:
+            ldi  grupo, 1
+            clr  blink
+            sts  BlinkCnt, r1
+        FechaWaitPb4:
+            sbis PINB, PB4
+            rjmp FechaWaitPb4
+            rjmp Main
+
+; ==============================================================================
+; SUBRUTINA: GetDiaActual
+; Retorna DiaDec*10 + DiaUni en temp
+; ==============================================================================
+GetDiaActual:
+    push r26
+    lds  r26, DiaDec
+    ldi  temp, 10
+    mul  r26, temp
+    lds  temp, DiaUni
+    add  temp, r0
+    pop  r26
+    ret
+
+; ==============================================================================
+; SUBRUTINA: GetMaxDias
+; Retorna maximo de dias del mes actual en r25
+; Febrero: anno par -> 29 dias, impar -> 28 (aproximacion bisiesto)
+; ==============================================================================
+GetMaxDias:
+    push temp
+    lds  temp, MesDec
+    tst  temp
+    breq JmpGetMaxDiasUnDigito
+    rjmp GetMaxDiasDosDig
+    JmpGetMaxDiasUnDigito:
+        rjmp GetMaxDiasUnDigito
+    GetMaxDiasDosDig:
+        ; MesDec=1 -> mes 10,11,12
+        lds  temp, MesUni
+        cpi  temp, 0
+        breq GetMaxDias31       ; Octubre   = 31
+        cpi  temp, 1
+        breq GetMaxDias30       ; Noviembre = 30
+        rjmp GetMaxDias31       ; Diciembre = 31
+
+    GetMaxDiasUnDigito:
+        lds  temp, MesUni
+        cpi  temp, 1
+        breq GetMaxDias31       ; Enero     = 31
+        cpi  temp, 2
+        breq GetMaxDiasFeb      ; Febrero   = 28/29
+        cpi  temp, 3
+        breq GetMaxDias31       ; Marzo     = 31
+        cpi  temp, 4
+        breq GetMaxDias30       ; Abril     = 30
+        cpi  temp, 5
+        breq GetMaxDias31       ; Mayo      = 31
+        cpi  temp, 6
+        breq GetMaxDias30       ; Junio     = 30
+        cpi  temp, 7
+        breq GetMaxDias31       ; Julio     = 31
+        cpi  temp, 8
+        breq GetMaxDias31       ; Agosto    = 31
+        cpi  temp, 9
+        breq GetMaxDias30       ; Septiembre= 30
+        rjmp GetMaxDias31
+
+    GetMaxDiasFeb:
+        ; Anno par -> bisiesto (aproximacion)
+        lds  temp, AnnoUni
+        sbrc temp, 0
+        rjmp GetMaxDias28
+        ldi  r25, 29
+        pop  temp
+        ret
+    GetMaxDias28:
+        ldi  r25, 28
+        pop  temp
+        ret
+    GetMaxDias30:
+        ldi  r25, 30
+        pop  temp
+        ret
+    GetMaxDias31:
+        ldi  r25, 31
+        pop  temp
+        ret
+
+; ==============================================================================
+; SUBRUTINA: SetDiaDesdeR25
+; Convierte r25 a DiaDec/DiaUni y lo guarda en SRAM
+; ==============================================================================
+SetDiaDesdeR25:
+    push temp
+    push r26
+    mov  temp, r25
+    clr  r26
+    SetDiaDesdeR25Loop:
+        cpi  temp, 10
+        brlo SetDiaDesdeR25Done
+        subi temp, 10
+        inc  r26
+        rjmp SetDiaDesdeR25Loop
+    SetDiaDesdeR25Done:
+        sts  DiaDec, r26
+        sts  DiaUni, temp
+    pop  r26
+    pop  temp
+    ret
+
+; ==============================================================================
+; SUBRUTINA: LimitarDia
+; Si el dia actual supera el maximo del mes lo ajusta al maximo
+; ==============================================================================
+LimitarDia:
+    push temp
+    push r25
+    rcall GetMaxDias
+    rcall GetDiaActual
+    cp   r25, temp
+    brsh LimitarDiaOk
+    rcall SetDiaDesdeR25
+    LimitarDiaOk:
+        pop  r25
+        pop  temp
+        ret
+
+; ==============================================================================
+; MODO 4 - SetAlarm
+; grupo=0: edita Minutos alarma | grupo=1: edita Horas alarma
+; Opera sobre registros HoraUniA/HoraDecA/MinUniA/MinDecA
+; No modifica el reloj principal
+; ==============================================================================
+SetAlarm:
+    sbic PINB, PB2
+    rjmp AlarmCheckPb3
+    tst  grupo
+    breq AlarmIncMinutos
+
+    AlarmIncHoras:
+        inc  HoraUniA
+        cpi  HoraUniA, 10
+        brlo AlarmCheckInc24
+        clr  HoraUniA
+        inc  HoraDecA
+        AlarmCheckInc24:
+            cpi  HoraDecA, 2
+            brne AlarmWaitPb2
+            cpi  HoraUniA, 4
+            brne AlarmWaitPb2
+            clr  HoraUniA
+            clr  HoraDecA
+            rjmp AlarmWaitPb2
+
+    AlarmIncMinutos:
+        inc  MinUniA
+        cpi  MinUniA, 10
+        brlo AlarmWaitPb2
+        clr  MinUniA
+        inc  MinDecA
+        cpi  MinDecA, 6
+        brlo AlarmWaitPb2
+        clr  MinUniA
+        clr  MinDecA
+
+    AlarmWaitPb2:
+        sbis PINB, PB2
+        rjmp AlarmWaitPb2
+
+    AlarmCheckPb3:
+        sbic PINB, PB3
+        rjmp AlarmCheckPb4
+        tst  grupo
+        breq AlarmDecMinutos
+
+        AlarmDecHoras:
+            tst  HoraUniA
+            brne AlarmDecHoraUni
+            tst  HoraDecA
+            brne AlarmDecHoraBorrow
+            ldi  HoraDecA, 2
+            ldi  HoraUniA, 3
+            rjmp AlarmWaitPb3
+            AlarmDecHoraBorrow:
+                dec  HoraDecA
+                ldi  HoraUniA, 9
+                rjmp AlarmWaitPb3
+            AlarmDecHoraUni:
+                dec  HoraUniA
+                rjmp AlarmWaitPb3
+
+        AlarmDecMinutos:
+            tst  MinUniA
+            brne AlarmDecMinUni
+            tst  MinDecA
+            brne AlarmDecMinBorrow
+            ldi  MinDecA, 5
+            ldi  MinUniA, 9
+            rjmp AlarmWaitPb3
+            AlarmDecMinBorrow:
+                dec  MinDecA
+                ldi  MinUniA, 9
+                rjmp AlarmWaitPb3
+            AlarmDecMinUni:
+                dec  MinUniA
+
+    AlarmWaitPb3:
+        sbis PINB, PB3
+        rjmp AlarmWaitPb3
+
+    AlarmCheckPb4:
+        sbic PINB, PB4
+        rjmp Main
+        tst  grupo
+        breq AlarmIrAHoras
+        clr  grupo
+        clr  blink
+        sts  BlinkCnt, r1
+        rjmp AlarmWaitPb4
+        AlarmIrAHoras:
+            ldi  grupo, 1
+            clr  blink
+            sts  BlinkCnt, r1
+        AlarmWaitPb4:
+            sbis PINB, PB4
+            rjmp AlarmWaitPb4
+            rjmp Main
+
+; ==============================================================================
+; ISR: Pcint0Isr - Pin Change Interrupt (PB0)
+; Cicla modos: 0 -> 1 -> 2 -> 3 -> 4 -> 0
+; Solo actua en flanco de bajada (boton presionado)
+; ==============================================================================
+Pcint0Isr:
+    push temp
+    in   temp, SREG
+    push temp
+    sbis PINB, PB0
+    rjmp PcintPresionado
+    rjmp PcintFin
+
+    PcintPresionado:
+        inc  modo
+        ldi  temp, 5
+        cp   modo, temp
+        brlo PcintSetup
+        clr  modo
+        PcintSetup:
+            clr  blink
+            clr  grupo
+            sts  BlinkCnt, r1
+
+    PcintFin:
+        pop  temp
+        out  SREG, temp
+        pop  temp
+        reti
+
+; ==============================================================================
+; ISR: Timer0Isr - Compare Match A (cada 1ms)
+; Responsabilidades:
+;   1. BlinkCnt: toggle de blink cada 250ms (siempre, todos los modos)
+;   2. Multiplexado de displays (4 digitos, uno por interrupcion)
+;   3. Conteo de tiempo (solo modo 0)
+;   4. Comparacion con alarma (al cambiar de minuto)
+; ==============================================================================
+Timer0Isr:
+    push temp
+    in   temp, SREG
+    push temp
+
+    ; Apagar todos los anodos antes de cambiar digito (evita ghosting)
+    cbi  PORTC, PC0
+    cbi  PORTC, PC1
+    cbi  PORTC, PC2
+    cbi  PORTC, PC3
+    cbi  PORTC, PC5
+
+    ; --- BlinkCnt corre SIEMPRE (todos los modos) ---
+    ; Toggle cada 250ms -> periodo 500ms (2Hz)
+    lds  temp, BlinkCnt
+    inc  temp
+    sts  BlinkCnt, temp
+    cpi  temp, 250
+    brne TimerCheckBlink
+    sts  BlinkCnt, r1
+    tst  blink
+    breq TimerBlinkOff
+    clr  blink
+    rjmp TimerCheckBlink
+    TimerBlinkOff:
+        ldi  blink, 1
+    TimerCheckBlink:
+
+    ; Modos display (0 y 2) -> ir directo al mux
+    cpi  modo, 0
+    breq JmpTimerIrMux
+    cpi  modo, 2
+    breq JmpTimerIrMux
+    ; Modos edicion (1,3,4) -> si blink=1 apagar display
+    tst  blink
+    breq JmpTimerIrMux2
+    rjmp IsrEnd
+    JmpTimerIrMux:
+        rjmp MuxDisplay
+    JmpTimerIrMux2:
+        rjmp MuxDisplay
+
+; ------------------------------------------------------------------------------
+; MuxDisplay - Selecciona que datos mostrar segun el modo activo
+; ------------------------------------------------------------------------------
+MuxDisplay:
+    sbi  PORTC, PC5
+    cpi  modo, 2
+    breq JmpMuxFecha
+    cpi  modo, 3
+    breq JmpMuxFecha
+    rjmp TimerCheckAlarm
+    JmpMuxFecha:
+        rjmp MuxFecha
+    TimerCheckAlarm:
+        cpi  modo, 4
+        breq JmpMuxAlarma
+        rjmp MuxHora
+        JmpMuxAlarma:
+            rjmp MuxAlarma
+
+; ------------------------------------------------------------------------------
+; MuxHora - Multiplexado HH:MM (modos 0 y 1)
+; mux=0: HoraDec | mux=1: HoraUni | mux=2: MinDec | mux=3: MinUni
+; ------------------------------------------------------------------------------
+MuxHora:
+    cpi  mux, 1
+    breq JmpMuxHoraUni
+    cpi  mux, 2
+    breq JmpMuxMinDec
+    cpi  mux, 3
+    breq JmpMuxMinUni
+    rjmp MuxHoraDec
+    JmpMuxHoraUni:
+        rjmp MuxHoraUni
+    JmpMuxMinDec:
+        rjmp MuxMinDec
+    JmpMuxMinUni:
+        rjmp MuxMinUni
+
+    MuxHoraDec:
+        lds  temp, HoraDec
+        rcall GetPattern
+        cpi  modo, 0
+        breq MuxHoraDecShow
+        tst  grupo
+        breq MuxHoraDecSkip
+        MuxHoraDecShow:
+            out  PORTD, temp
+            sbi  PORTC, PC0
+        MuxHoraDecSkip:
+            ldi  mux, 1
+            rjmp UpdateTime
+
+    MuxHoraUni:
+        lds  temp, HoraUni
+        rcall GetPattern
+        cpi  modo, 0
+        breq MuxHoraUniShow
+        tst  grupo
+        breq MuxHoraUniSkip
+        MuxHoraUniShow:
+            out  PORTD, temp
+            sbi  PORTC, PC1
+        MuxHoraUniSkip:
+            ldi  mux, 2
+            rjmp UpdateTime
+
+    MuxMinDec:
+        lds  temp, MinDec
+        rcall GetPattern
+        cpi  modo, 0
+        breq MuxMinDecShow
+        tst  grupo
+        brne MuxMinDecSkip
+        MuxMinDecShow:
+            out  PORTD, temp
+            sbi  PORTC, PC2
+        MuxMinDecSkip:
+            ldi  mux, 3
+            rjmp UpdateTime
+
+    MuxMinUni:
+        lds  temp, MinUni
+        rcall GetPattern
+        cpi  modo, 0
+        breq MuxMinUniShow
+        tst  grupo
+        brne MuxMinUniSkip
+        MuxMinUniShow:
+            out  PORTD, temp
+            sbi  PORTC, PC3
+        MuxMinUniSkip:
+            ldi  mux, 0
+            rjmp UpdateTime
+
+; ------------------------------------------------------------------------------
+; MuxFecha - Multiplexado DD/MM (modos 2 y 3)
+; mux=0: DiaDec | mux=1: DiaUni | mux=2: MesDec | mux=3: MesUni
+; ------------------------------------------------------------------------------
+MuxFecha:
+    cpi  mux, 1
+    breq JmpMuxDiaUni
+    cpi  mux, 2
+    breq JmpMuxMesDec
+    cpi  mux, 3
+    breq JmpMuxMesUni
+    rjmp MuxFechaDiaDec
+    JmpMuxDiaUni:
+        rjmp MuxFechaDiaUni
+    JmpMuxMesDec:
+        rjmp MuxFechaMesDec
+    JmpMuxMesUni:
+        rjmp MuxFechaMesUni
+
+    MuxFechaDiaDec:
+        lds  temp, DiaDec
+        rcall GetPattern
+        cpi  modo, 2
+        breq MuxFechaDiaDecShow
+        tst  grupo
+        brne MuxFechaDiaDecSkip
+        MuxFechaDiaDecShow:
+            out  PORTD, temp
+            sbi  PORTC, PC0
+        MuxFechaDiaDecSkip:
+            ldi  mux, 1
+            rjmp UpdateTime
+
+    MuxFechaDiaUni:
+        lds  temp, DiaUni
+        rcall GetPattern
+        cpi  modo, 2
+        breq MuxFechaDiaUniShow
+        tst  grupo
+        brne MuxFechaDiaUniSkip
+        MuxFechaDiaUniShow:
+            out  PORTD, temp
+            sbi  PORTC, PC1
+        MuxFechaDiaUniSkip:
+            ldi  mux, 2
+            rjmp UpdateTime
+
+    MuxFechaMesDec:
+        lds  temp, MesDec
+        rcall GetPattern
+        cpi  modo, 2
+        breq MuxFechaMesDecShow
+        tst  grupo
+        breq MuxFechaMesDecSkip
+        MuxFechaMesDecShow:
+            out  PORTD, temp
+            sbi  PORTC, PC2
+        MuxFechaMesDecSkip:
+            ldi  mux, 3
+            rjmp UpdateTime
+
+    MuxFechaMesUni:
+        lds  temp, MesUni
+        rcall GetPattern
+        cpi  modo, 2
+        breq MuxFechaMesUniShow
+        tst  grupo
+        breq MuxFechaMesUniSkip
+        MuxFechaMesUniShow:
+            out  PORTD, temp
+            sbi  PORTC, PC3
+        MuxFechaMesUniSkip:
+            ldi  mux, 0
+            rjmp UpdateTime
+
+; ------------------------------------------------------------------------------
+; MuxAlarma - Multiplexado HH:MM alarma (modo 4)
+; Datos de registros HoraDecA/HoraUniA/MinDecA/MinUniA
+; ------------------------------------------------------------------------------
+MuxAlarma:
+    cpi  mux, 1
+    breq JmpMuxAlarmaHoraUni
+    cpi  mux, 2
+    breq JmpMuxAlarmaMinDec
+    cpi  mux, 3
+    breq JmpMuxAlarmaMinUni
+    rjmp MuxAlarmaHoraDec
+    JmpMuxAlarmaHoraUni:
+        rjmp MuxAlarmaHoraUni
+    JmpMuxAlarmaMinDec:
+        rjmp MuxAlarmaMinDec
+    JmpMuxAlarmaMinUni:
+        rjmp MuxAlarmaMinUni
+
+    MuxAlarmaHoraDec:
+        mov  temp, HoraDecA
+        rcall GetPattern
+        tst  grupo
+        breq MuxAlarmaHoraDecSkip
+        out  PORTD, temp
+        sbi  PORTC, PC0
+        MuxAlarmaHoraDecSkip:
+            ldi  mux, 1
+            rjmp UpdateTime
+
+    MuxAlarmaHoraUni:
+        mov  temp, HoraUniA
+        rcall GetPattern
+        tst  grupo
+        breq MuxAlarmaHoraUniSkip
+        out  PORTD, temp
+        sbi  PORTC, PC1
+        MuxAlarmaHoraUniSkip:
+            ldi  mux, 2
+            rjmp UpdateTime
+
+    MuxAlarmaMinDec:
+        mov  temp, MinDecA
+        rcall GetPattern
+        tst  grupo
+        brne MuxAlarmaMinDecSkip
+        out  PORTD, temp
+        sbi  PORTC, PC2
+        MuxAlarmaMinDecSkip:
+            ldi  mux, 3
+            rjmp UpdateTime
+
+    MuxAlarmaMinUni:
+        mov  temp, MinUniA
+        rcall GetPattern
+        tst  grupo
+        brne MuxAlarmaMinUniSkip
+        out  PORTD, temp
+        sbi  PORTC, PC3
+        MuxAlarmaMinUniSkip:
+            ldi  mux, 0
+
+; ------------------------------------------------------------------------------
+; UpdateTime - Incrementa el tiempo (solo en modo 0)
+; Cadena: MsLow(250) -> MsHigh(4) -> Seg(60) -> Min -> Hora
+; Al llegar a 60seg setea MinutoCambio=1 para disparo de alarma
+; ------------------------------------------------------------------------------
+UpdateTime:
+    cpi  modo, 0
+    breq UpdateTimeContinue
+    rjmp CheckAlarma
+
+    UpdateTimeContinue:
+        lds  temp, MsLow
+        inc  temp
+        sts  MsLow, temp
+        cpi  temp, 250
+        brne UpdateTimeMsLowSkip
+        rjmp UpdateTimeMsLowDone
+        UpdateTimeMsLowSkip:
+            rjmp CheckAlarma
+        UpdateTimeMsLowDone:
+            sts  MsLow, r1
+
+        lds  temp, MsHigh
+        inc  temp
+        sts  MsHigh, temp
+        cpi  temp, 4
+        brne UpdateTimeMsHighSkip
+        rjmp UpdateTimeMsHighDone
+        UpdateTimeMsHighSkip:
+            rjmp CheckAlarma
+        UpdateTimeMsHighDone:
+            sts  MsHigh, r1
+
+        lds  temp, Segundos
+        inc  temp
+        sts  Segundos, temp
+        cpi  temp, 60
+        brne UpdateTimeSegSkip
+        rjmp UpdateTimeSegDone
+        UpdateTimeSegSkip:
+            rjmp CheckAlarma
+        UpdateTimeSegDone:
+            sts  Segundos, r1
+            ldi  temp, 1
+            sts  MinutoCambio, temp     ; Avisar cambio de minuto
+
+        lds  temp, MinUni
+        inc  temp
+        sts  MinUni, temp
+        cpi  temp, 10
+        brne UpdateTimeMinUniSkip
+        rjmp UpdateTimeMinUniDone
+        UpdateTimeMinUniSkip:
+            rjmp CheckAlarma
+        UpdateTimeMinUniDone:
+            sts  MinUni, r1
+
+        lds  temp, MinDec
+        inc  temp
+        sts  MinDec, temp
+        cpi  temp, 6
+        brne UpdateTimeMinDecSkip
+        rjmp UpdateTimeMinDecDone
+        UpdateTimeMinDecSkip:
+            rjmp CheckAlarma
+        UpdateTimeMinDecDone:
+            sts  MinDec, r1
+
+        lds  temp, HoraUni
+        inc  temp
+        sts  HoraUni, temp
+        cpi  temp, 10
+        brne UpdateTimeCheckHora24
+        sts  HoraUni, r1
+        lds  temp, HoraDec
+        inc  temp
+        sts  HoraDec, temp
+        rjmp CheckAlarma
+
+        UpdateTimeCheckHora24:
+            lds  temp, HoraDec
+            cpi  temp, 2
+            brne JmpCheckAlarma
+            lds  temp, HoraUni
+            cpi  temp, 4
+            brne JmpCheckAlarma
+            sts  HoraUni, r1
+            sts  HoraDec, r1
+            rjmp CheckAlarma
+            JmpCheckAlarma:
+                rjmp CheckAlarma
+
+; ------------------------------------------------------------------------------
+; CheckAlarma - Manejo de alarma
+; AlarmOn=1: buzzer sigue blink (pitido intermitente cada 500ms)
+; AlarmOn=0: comparar hora con alarma al cambiar minuto
+; PB1 en Main apaga la alarma
+; ------------------------------------------------------------------------------
+CheckAlarma:
+    lds  temp, AlarmOn
+    tst  temp
+    breq CheckAlarmaComparar
+
+    ; Alarma activa -> buzzer sigue blink
+    tst  blink
+    breq CheckAlarmaBuzzerOff
+    sbi  PORTD, PD7
+    rjmp CheckAlarmaFin
+    CheckAlarmaBuzzerOff:
+        cbi  PORTD, PD7
+        rjmp CheckAlarmaFin
+
+    CheckAlarmaComparar:
+        ; Solo comparar cuando el minuto acaba de cambiar
+        lds  temp, MinutoCambio
+        tst  temp
+        breq CheckAlarmaFin
+        sts  MinutoCambio, r1
+        lds  temp, HoraUni
+        cp   temp, HoraUniA
+        brne CheckAlarmaFin
+        lds  temp, HoraDec
+        cp   temp, HoraDecA
+        brne CheckAlarmaFin
+        lds  temp, MinUni
+        cp   temp, MinUniA
+        brne CheckAlarmaFin
+        lds  temp, MinDec
+        cp   temp, MinDecA
+        brne CheckAlarmaFin
+        ldi  temp, 1
+        sts  AlarmOn, temp      ; Coincidencia -> activar alarma
+
+    CheckAlarmaFin:
+IsrEnd:
+    pop  temp
+    out  SREG, temp
+    pop  temp
+    reti
+
+; ==============================================================================
+; SUBRUTINA: GetPattern
+; Entrada: temp = digito (0-9)
+; Salida:  temp = patron 7 segmentos
+; ==============================================================================
+GetPattern:
+    push r30
+    push r31
+    ldi  ZH, high(Table7Seg<<1)
+    ldi  ZL, low(Table7Seg<<1)
+    add  ZL, temp
+    adc  ZH, r1
+    lpm  temp, Z
+    pop  r31
+    pop  r30
+    ret

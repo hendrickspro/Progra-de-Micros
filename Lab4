@@ -1,0 +1,136 @@
+/*
+  Angel Ortiz  - 24377
+  Contador de 8 bits - ATmega328P
+ 
+  Bits del contador (MSB → LSB):
+    Bit 7: PB4
+    Bit 6: PB3
+    Bit 5: PB2
+    Bit 4: PB1
+    Bit 3: PB0
+    Bit 2: PD7
+    Bit 1: PD6
+    Bit 0: PD5  
+  Botones:
+   PD0 → Incrementar (Pull-up interno, activo en LOW)
+   PD1 → Decrementar (Pull-up interno, activo en LOW)
+ 
+  Rango: 0–255 con overflow/underflow (255+1=0, 0-1=255)
+ 
+ */
+
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <util/delay.h>
+
+// PORTB: bits 7-3 del contador → PB4(bit7) PB3(bit6) PB2(bit5) PB1(bit4) PB0(bit3) 
+#define CounterPortbMask  ((1<<PB4)|(1<<PB3)|(1<<PB2)|(1<<PB1)|(1<<PB0))
+
+// PORTD: bits 2-0 del contador → PD7(bit2) PD6(bit1) PD5(bit0)
+// botones en PD0 y PD1 (entradas) 
+#define CounterPortdMask  ((1<<PD7)|(1<<PD6)|(1<<PD5))
+#define BtnInc            (1<<PD0)
+#define BtnDec            (1<<PD1)
+
+// Antirebote (Debounce)
+#define DebounceMs        20
+
+
+static void HwInit(void);
+static void Display(uint8_t Val);
+static uint8_t BtnPressed(uint8_t Mask);
+
+int main(void)
+{
+    uint8_t Counter = 0;
+
+    HwInit();
+    Display(Counter);
+
+    while (1)
+    {
+        if (BtnPressed(BtnInc))
+        {
+            Counter++;          // wrap-around 255 → 0 automático
+            Display(Counter);
+        }
+
+        if (BtnPressed(BtnDec))
+        {
+            Counter--;          // wrap-around 0 → 255 automático
+            Display(Counter);
+        }
+    }
+}
+
+// Inicialización de hardware
+static void HwInit(void)
+{
+    // Configurar pines de contador como salidas
+    DDRB |=  CounterPortbMask;
+    DDRD |=  CounterPortdMask;
+
+    // Configurar botones como entradas con pull-up interno
+    DDRD  &= ~(BtnInc | BtnDec);
+    PORTD |=  (BtnInc | BtnDec);
+
+    // Apagar todos los LEDs al inicio
+    PORTB &= ~CounterPortbMask;
+    PORTD &= ~CounterPortdMask;
+}
+
+// Escribir valor en los pines de salida
+/*
+  Mapeo de bits:
+ 
+    bit 7  →  PB4
+    bit 6  →  PB3
+    bit 5  →  PB2
+    bit 4  →  PB1
+    bit 3  →  PB0
+    bit 2  →  PD7
+    bit 1  →  PD6
+    bit 0  →  PD5
+	
+ */
+static void Display(uint8_t Val)
+{
+    // PORTB
+    uint8_t Portb = PORTB & ~CounterPortbMask;   // limpia solo los pines del contador
+
+    if (Val & (1<<7)) Portb |= (1<<PB4);
+    if (Val & (1<<6)) Portb |= (1<<PB3);
+    if (Val & (1<<5)) Portb |= (1<<PB2);
+    if (Val & (1<<4)) Portb |= (1<<PB1);
+    if (Val & (1<<3)) Portb |= (1<<PB0);
+
+    PORTB = Portb;
+
+    // PORTD
+    uint8_t Portd = PORTD & ~CounterPortdMask;   // preserva PD0, PD1 y PD4
+
+    if (Val & (1<<2)) Portd |= (1<<PD7);
+    if (Val & (1<<1)) Portd |= (1<<PD6);
+    if (Val & (1<<0)) Portd |= (1<<PD5);
+
+    PORTD = Portd;
+}
+
+// Lectura de boton con antirebote
+// boton en pullup
+static uint8_t BtnPressed(uint8_t Mask)
+{
+    if (!(PIND & Mask))                 // botón presionado (LOW)
+    {
+        _delay_ms(DebounceMs);          // esperar estabilización
+
+        if (!(PIND & Mask))             // confirmar que sigue presionado
+        {
+            while (!(PIND & Mask));     // esperar hasta que se suelte
+            _delay_ms(DebounceMs);      // antirebote al soltar
+            return 1;
+        }
+    }
+    return 0;
+}

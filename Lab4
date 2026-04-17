@@ -1,136 +1,280 @@
-/*
-  Angel Ortiz  - 24377
-  Contador de 8 bits - ATmega328P
- 
-  Bits del contador (MSB → LSB):
-    Bit 7: PB4
-    Bit 6: PB3
-    Bit 5: PB2
-    Bit 4: PB1
-    Bit 3: PB0
-    Bit 2: PD7
-    Bit 1: PD6
-    Bit 0: PD5  
-  Botones:
-   PD0 → Incrementar (Pull-up interno, activo en LOW)
-   PD1 → Decrementar (Pull-up interno, activo en LOW)
- 
-  Rango: 0–255 con overflow/underflow (255+1=0, 0-1=255)
- 
- */
-
 #define F_CPU 16000000UL
-
 #include <avr/io.h>
-#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <stdint.h>
 
-// PORTB: bits 7-3 del contador → PB4(bit7) PB3(bit6) PB2(bit5) PB1(bit4) PB0(bit3) 
-#define CounterPortbMask  ((1<<PB4)|(1<<PB3)|(1<<PB2)|(1<<PB1)|(1<<PB0))
+// ── Timer0 preload ───────────────────────────────────────────
+// F_sistema = 1MHz, prescaler /8 → 125kHz
+// 256 - 131 = 125 ticks → ~1ms por overflow
+#define TCNT0_PRELOAD  131
 
-// PORTD: bits 2-0 del contador → PD7(bit2) PD6(bit1) PD5(bit0)
-// botones en PD0 y PD1 (entradas) 
-#define CounterPortdMask  ((1<<PD7)|(1<<PD6)|(1<<PD5))
-#define BtnInc            (1<<PD0)
-#define BtnDec            (1<<PD1)
+// ── Pines de selección (cátodo común, activo HIGH) ───────────
+#define SEL_CNT   (1<<PD2)
+#define SEL_UNI   (1<<PD3)
+#define SEL_DEC   (1<<PD4)
+#define SEL_MASK  (SEL_CNT | SEL_UNI | SEL_DEC)
 
-// Antirebote (Debounce)
-#define DebounceMs        20
+// ── Botones ──────────────────────────────────────────────────
+#define BTN_INC   (1<<PD0)
+#define BTN_DEC   (1<<PD1)
 
+// ── Alarma ───────────────────────────────────────────────────
+#define ALARM_PIN  PC4
+#define ALARM_BIT  (1<<ALARM_PIN)
 
-static void HwInit(void);
-static void Display(uint8_t Val);
-static uint8_t BtnPressed(uint8_t Mask);
+// ── Máscaras de segmentos ────────────────────────────────────
+#define SEG_MASK_B  0x1F   // PB4-PB0 (segs A-E)
+#define SEG_MASK_D  0xC0   // PD7-PD6 (segs F-G)
+
+// ── Variables globales ───────────────────────────────────────
+volatile uint8_t contador = 0;
+volatile uint8_t nibbleH  = 0;
+volatile uint8_t nibbleL  = 0;
+volatile uint8_t adcVal   = 0;
+volatile uint8_t muxStep  = 0;
+
+// ============================================================
+//  Tabla de segmentos hex 0-F (cátodo común, activo HIGH)
+//  PORTB: PB4=A PB3=B PB2=C PB1=D PB0=E
+//  PORTD: PD7=F PD6=G
+//
+//       A  B  C  D  E  F  G    pb    pd
+//  0:   1  1  1  1  1  1  0   0x1F  0x80
+//  1:   0  1  1  0  0  0  0   0x0C  0x00
+//  2:   1  1  0  1  1  0  1   0x1B  0x40
+//  3:   1  1  1  1  0  0  1   0x1E  0x40
+//  4:   0  1  1  0  0  1  1   0x0C  0xC0
+//  5:   1  0  1  1  0  1  1   0x16  0xC0
+//  6:   1  0  1  1  1  1  1   0x17  0xC0
+//  7:   1  1  1  0  0  0  0   0x1C  0x00
+//  8:   1  1  1  1  1  1  1   0x1F  0xC0
+//  9:   1  1  1  1  0  1  1   0x1E  0xC0
+//  A:   1  1  1  0  1  1  1   0x1D  0xC0
+//  B:   0  0  1  1  1  1  1   0x07  0xC0
+//  C:   1  0  0  1  1  1  0   0x13  0x80
+//  D:   0  1  1  1  1  0  1   0x0F  0x40
+//  E:   1  0  0  1  1  1  1   0x13  0xC0
+//  F:   1  0  0  0  1  1  1   0x11  0xC0
+// ============================================================
+typedef struct { uint8_t pb; uint8_t pd; } SegPat;
+
+static const SegPat segTab[16] = {
+	{ 0x1F, 0x80 }, // 0
+	{ 0x0C, 0x00 }, // 1
+	{ 0x1B, 0x40 }, // 2
+	{ 0x1E, 0x40 }, // 3
+	{ 0x0C, 0xC0 }, // 4
+	{ 0x16, 0xC0 }, // 5
+	{ 0x17, 0xC0 }, // 6
+	{ 0x1C, 0x00 }, // 7
+	{ 0x1F, 0xC0 }, // 8
+	{ 0x1E, 0xC0 }, // 9
+	{ 0x1D, 0xC0 }, // A
+	{ 0x07, 0xC0 }, // B
+	{ 0x13, 0x80 }, // C
+	{ 0x0F, 0x40 }, // D
+	{ 0x13, 0xC0 }, // E
+	{ 0x11, 0xC0 }  // F
+};
+
+// ── Prototipos ────────────────────────────────────────────────
+void setup(void);
+void initADC(void);
+void initTMR0(void);
 
 int main(void)
 {
-    uint8_t Counter = 0;
+	cli();
 
-    HwInit();
-    Display(Counter);
+	setup();
+	initADC();
+	initTMR0();
 
-    while (1)
-    {
-        if (BtnPressed(BtnInc))
-        {
-            Counter++;          // wrap-around 255 → 0 automático
-            Display(Counter);
-        }
+	// PCINT2: botones en PD0 (PCINT16) y PD1 (PCINT17)
+	PCICR  |= (1<<PCIE2);
+	PCMSK2 |= (1<<PCINT16) | (1<<PCINT17);
 
-        if (BtnPressed(BtnDec))
-        {
-            Counter--;          // wrap-around 0 → 255 automático
-            Display(Counter);
-        }
-    }
+	// Timer0: habilitar interrupción overflow
+	TIMSK0 |= (1<<TOIE0);
+
+	// ADC: habilitar interrupción y arrancar primera conversión
+	ADCSRA |= (1<<ADIE) | (1<<ADSC);
+
+	sei();
+
+	while (1)
+	{
+		// Alarma: se evalúa constantemente en el loop principal
+		// adcVal y contador son volatile, siempre tienen el valor más reciente
+		if (adcVal > contador)
+		{
+			PORTC |=  ALARM_BIT;
+		}
+		else
+		{
+			PORTC &= ~ALARM_BIT;
+		}
+	}
 }
 
-// Inicialización de hardware
-static void HwInit(void)
+// ============================================================
+//  setup
+// ============================================================
+void setup(void)
 {
-    // Configurar pines de contador como salidas
-    DDRB |=  CounterPortbMask;
-    DDRD |=  CounterPortdMask;
+	// Reducir reloj a 1MHz (prescaler /16 del oscilador externo 16MHz)
+	CLKPR = (1<<CLKPCE);  // habilitar escritura de CLKPR
+	CLKPR = (1<<CLKPS2);  // CLKPS = 0100 → /16 → 1MHz
 
-    // Configurar botones como entradas con pull-up interno
-    DDRD  &= ~(BtnInc | BtnDec);
-    PORTD |=  (BtnInc | BtnDec);
+	// PORTB: PB4-PB0 salidas (segs A-E y bits 7-3 contador)
+	DDRB  =  0x1F;
+	PORTB =  0x00;
 
-    // Apagar todos los LEDs al inicio
-    PORTB &= ~CounterPortbMask;
-    PORTD &= ~CounterPortdMask;
+	// PORTD:
+	//   PD7-PD2: salidas (segs F-G, sel mux, bit2-bit0 contador)
+	//   PD1-PD0: entradas con pull-up (botones)
+	DDRD  =  0b11111100;
+	PORTD =  BTN_INC | BTN_DEC;  // pull-up en botones, resto en 0
+
+	// PORTC:
+	//   PC4: salida (LED alarma)
+	//   PC3: entrada sin pull-up (ADC3, analógico)
+	DDRC  &= ~(1<<PC3);   // PC3 entrada analógica (por si acaso)
+	DDRC  |=  ALARM_BIT;  // PC4 salida
+	PORTC &= ~ALARM_BIT;  // alarma apagada al inicio
 }
 
-// Escribir valor en los pines de salida
+// ============================================================
+//  initADC
+//  Canal: ADC3 (A3 = PC3)
+//  Referencia: AVCC (5V)
+//  ADLAR = 1 → resultado alineado izquierda, leer solo ADCH
+//  Prescaler /8 → 1MHz/8 = 125kHz
+// ============================================================
+void initADC(void)
+{
+	// Limpiar y configurar ADMUX
+	ADMUX = (1<<REFS0)  // referencia AVCC
+	| (1<<ADLAR)  // alinear izquierda (8 bits en ADCH)
+	| (1<<MUX1)   // canal ADC3: MUX[3:0] = 0011
+	| (1<<MUX0);
+
+	// Limpiar y configurar ADCSRA
+	// ADEN=1  → habilitar ADC
+	// ADPS1=1, ADPS0=1 → prescaler /8
+	ADCSRA = (1<<ADEN) | (1<<ADPS1) | (1<<ADPS0);
+}
+
 /*
-  Mapeo de bits:
- 
-    bit 7  →  PB4
-    bit 6  →  PB3
-    bit 5  →  PB2
-    bit 4  →  PB1
-    bit 3  →  PB0
-    bit 2  →  PD7
-    bit 1  →  PD6
-    bit 0  →  PD5
-	
- */
-static void Display(uint8_t Val)
+ initTMR0
+ Modo normal, prescaler /8
+ Con 1MHz y prescaler /8 → 125kHz
+ Preload 131 → 256-131 = 125 ticks → ~1ms por overflow
+*/
+void initTMR0(void)
 {
-    // PORTB
-    uint8_t Portb = PORTB & ~CounterPortbMask;   // limpia solo los pines del contador
+	// Modo normal: WGM02:WGM01:WGM00 = 000
+	TCCR0A &= ~((1<<WGM01) | (1<<WGM00));
+	TCCR0B &= ~(1<<WGM02);
 
-    if (Val & (1<<7)) Portb |= (1<<PB4);
-    if (Val & (1<<6)) Portb |= (1<<PB3);
-    if (Val & (1<<5)) Portb |= (1<<PB2);
-    if (Val & (1<<4)) Portb |= (1<<PB1);
-    if (Val & (1<<3)) Portb |= (1<<PB0);
+	// Prescaler /8: CS02:CS01:CS00 = 010
+	TCCR0B &= ~((1<<CS02) | (1<<CS00));
+	TCCR0B |=   (1<<CS01);
 
-    PORTB = Portb;
-
-    // PORTD
-    uint8_t Portd = PORTD & ~CounterPortdMask;   // preserva PD0, PD1 y PD4
-
-    if (Val & (1<<2)) Portd |= (1<<PD7);
-    if (Val & (1<<1)) Portd |= (1<<PD6);
-    if (Val & (1<<0)) Portd |= (1<<PD5);
-
-    PORTD = Portd;
+	// Cargar preload
+	TCNT0 = TCNT0_PRELOAD;
 }
 
-// Lectura de boton con antirebote
-// boton en pullup
-static uint8_t BtnPressed(uint8_t Mask)
-{
-    if (!(PIND & Mask))                 // botón presionado (LOW)
-    {
-        _delay_ms(DebounceMs);          // esperar estabilización
+/*
+  ISR Timer0 overflow — multiplexión
 
-        if (!(PIND & Mask))             // confirmar que sigue presionado
-        {
-            while (!(PIND & Mask));     // esperar hasta que se suelte
-            _delay_ms(DebounceMs);      // antirebote al soltar
-            return 1;
-        }
-    }
-    return 0;
+  Paso 0 → PD2 activo: contador binario en D12-D5
+  Paso 1 → PD3 activo: nibbleL del ADC en display unidades
+  Paso 2 → PD4 activo: nibbleH del ADC en display decenas
+
+  Secuencia sin ghosting:
+    1. Apagar todas las selecciones
+    2. Apagar todos los outputs
+    3. Cargar nuevo patrón
+    4. Activar la selección correspondiente
+*/
+ISR(TIMER0_OVF_vect)
+{
+	TCNT0 = TCNT0_PRELOAD;
+
+	// 1. Apagar selecciones
+	PORTD &= ~SEL_MASK;
+
+	// 2. Apagar outputs
+	PORTB &= ~SEG_MASK_B;
+	PORTD &= ~SEG_MASK_D;
+	PORTD &= ~(1<<PD5);
+
+	// 3 y 4. Cargar patrón y activar selección
+	switch (muxStep)
+	{
+		case 0:
+		// Bits 7-3 del contador → PB4-PB0
+		PORTB |= (contador >> 3) & SEG_MASK_B;
+		// Bit 2 → PD7, bit 1 → PD6
+		if (contador & (1<<2)) PORTD |= (1<<PD7);
+		if (contador & (1<<1)) PORTD |= (1<<PD6);
+		// Bit 0 → PD5
+		if (contador & (1<<0)) PORTD |= (1<<PD5);
+		PORTD |= SEL_CNT;
+		break;
+
+		case 1:
+		// Display unidades: nibbleL en hex
+		PORTB |= segTab[nibbleL].pb;
+		PORTD |= segTab[nibbleL].pd;
+		PORTD |= SEL_UNI;
+		break;
+
+		case 2:
+		// Display decenas: nibbleH en hex
+		PORTB |= segTab[nibbleH].pb;
+		PORTD |= segTab[nibbleH].pd;
+		PORTD |= SEL_DEC;
+		break;
+
+		default:
+		muxStep = 0;
+		break;
+	}
+
+	muxStep++;
+	if (muxStep > 2) muxStep = 0;
+}
+
+//  ISR PCINT2 — botones PD0 (inc) y PD1 (dec)
+//  Activos en LOW con pull-up interno
+
+ISR(PCINT2_vect)
+{
+	if (!(PIND & BTN_INC))
+	{
+		contador++;
+	}
+	if (!(PIND & BTN_DEC))
+	{
+		contador--;
+	}
+}
+
+
+//  ISR ADC — lectura completa del potenciómetro
+//  ADLAR=1 → solo se lee ADCH (8 bits efectivos, 0x00-0xFF)
+//  nibbleH = bits [7:4], nibbleL = bits [3:0]
+//  Alarma: enciende PC4 si adcVal > contador (post-lab)
+//  Al final relanza la conversión para modo continuo
+
+ISR(ADC_vect)
+{
+	adcVal  = ADCH;
+	nibbleL =  adcVal        & 0x0F;
+	nibbleH = (adcVal >> 4)  & 0x0F;
+
+	// Relanzar conversión (continuo por software)
+	ADCSRA |= (1<<ADSC);
 }

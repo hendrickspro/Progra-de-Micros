@@ -1,0 +1,40 @@
+#define F_CPU 16000000UL
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <stdint.h>
+
+#include "adc.h"
+#include "pwm1.h"
+#include "pwm2.h"
+
+static uint16_t mapAdcAServoUs(uint16_t valorAdc)
+{
+	return (uint16_t)(1000U + ((uint32_t)valorAdc * 1000U) / 1023U);
+}
+
+static uint8_t mapAdcADuty(uint16_t valorAdc)
+{
+	return (uint8_t)(((uint32_t)valorAdc * 255U) / 1023U);
+}
+
+int main(void)
+{
+	cli();
+
+	iniciarAdc();
+	iniciarPwm1();          
+	iniciarPwm2();          
+	iniciarPwmManualLed();  
+
+	sei();
+
+	while (1) {
+		uint16_t valorA0 = leerAdc(0);
+		uint16_t valorA1 = leerAdc(1);
+		uint16_t valorA2 = leerAdc(2);
+
+		setServo1Us(mapAdcAServoUs(valorA0));
+		setServo2Us(mapAdcAServoUs(valorA1));
+		setLedDuty(mapAdcADuty(valorA2));
+	}
+}
